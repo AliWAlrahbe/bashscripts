@@ -1,0 +1,95 @@
+#!/bin/bash
+
+# A script to perform a daily backup of WordPress files and database,
+# then securely sync them to an encrypted Rclone remote.
+
+# --- Stop script on any error ---
+set -e
+set -o pipefail
+
+# --- Error Handling ---
+handle_error() {
+    log "--- SCRIPT FAILED ---"
+    log "An error occurred during the backup process. Please check the logs."
+    exit 1
+}
+trap 'handle_error' ERR
+
+# --- Configuration Variables (EDIT THESE) ---
+
+# -- WordPress Database Credentials --
+# IMPORTANT: This script assumes you have a .my.cnf file in the root or home directory
+# with your [mysqldump] credentials, like this:
+# [mysqldump]
+# user=your_db_user
+# password=your_db_password
+DB_NAME="wordpress"
+
+# -- Backup Paths --
+WP_FILES_PATH="/var/www/html"
+DB_BACKUP_PATH="/dbbackup"
+BORG_REPO="/borgbackup"
+
+# -- Borg Settings --
+# IMPORTANT: This script reads the Borg passphrase from the file /root/.borg_passphrase
+export BORG_PASSPHRASE=$(cat /root/.borg_passphrase)
+
+# -- Rclone Settings --
+# IMPORTANT: Rclone must be configured with a remote named 's3-encrypted'.
+RCLONE_REMOTE="s3-encrypted"
+RCLONE_DESTINATION="backups/borg" # A destination folder on the remote
+
+# --- End of Configuration ---
+
+
+# --- Logging Function ---
+log() {
+    echo "$(date "+%Y-%m-%d %H:%M:%S") - $1"
+}
+
+log "--- Starting Daily Backup ---"
+
+# --- Main Backup Logic ---
+
+# 1. Clean up old SQL dump files (older than 30 days)
+log "Step 1/5: Cleaning up old SQL dump files..."
+find "$DB_BACKUP_PATH" -name "*.sql" -mtime +29 -delete
+log "Old SQL dumps cleaned up."
+
+# 2. Create a backup of the WordPress database with a unique timestamp
+log "Step 2/5: Backing up WordPress database..."
+mkdir -p "$DB_BACKUP_PATH"
+TIMESTAMP=$(date +%Y-%m-%d-%H%M%S)
+SQL_DUMP_FILENAME="$DB_NAME-$TIMESTAMP.sql"
+SQL_DUMP_PATH="$DB_BACKUP_PATH/$SQL_DUMP_FILENAME"
+mysqldump "$DB_NAME" > "$SQL_DUMP_PATH"
+log "Database backup complete: $SQL_DUMP_FILENAME"
+
+# 3. Create a Borg backup with a unique timestamp
+log "Step 3/5: Creating Borg backup..."
+BORG_ARCHIVE_NAME="wp-full-$TIMESTAMP"
+borg create --stats --progress \
+    "$BORG_REPO::$BORG_ARCHIVE_NAME" \
+    "$WP_FILES_PATH" \
+    "$SQL_DUMP_PATH"
+log "Borg backup created: $BORG_ARCHIVE_NAME"
+
+# 4. Prune old Borg backups to save space
+log "Step 4/5: Pruning old Borg backups..."
+# --keep-within=1d keeps all backups from the last 24 hours.
+borg prune -v --list \
+    --keep-within=1d \
+    --keep-daily=7 \
+    --keep-weekly=4 \
+    --keep-monthly=6 \
+    "$BORG_REPO"
+log "Pruning complete."
+
+# 5. Sync the Borg repository to the Rclone remote
+log "Step 5/5: Syncing repository to Rclone remote..."
+rclone sync "$BORG_REPO" "$RCLONE_REMOTE:$RCLONE_DESTINATION" --transfers=10 --checkers=10 --progress
+log "Sync complete."
+
+log "--- Daily Backup Finished Successfully ---"
+
+exit 0
